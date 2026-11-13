@@ -263,89 +263,108 @@ def stream_reader_loop():
         time.sleep(2)
 
 
-# ================= MAPEADOR INTELIGENTE DE MOVIMENTO E PRESENÇA CORPORAL =================
+# ================= MAPEADOR INTELIGENTE DE MOVIMENTO E PRESENÇA (ANTI-SOMBRA) =================
 class SmartPresenceTracker:
     """
-    Mapeia em tempo real qualquer pessoa ou movimentação na câmera (mesmo vista de cima em ângulo
-    íngreme ou à noite), mantendo a marcação ativa mesmo se a pessoa parar dentro da zona demarcada.
+    Mapeia pessoas, animais e movimentações reais eliminando sombras (MOG2 detectShadows=True +
+    supressão cromática/gradiente + verificação de movimento real curto prazo para nunca travar em manchas de sol/sombra).
     """
 
     def __init__(self):
-        self.bg_float = None
         self.mw = 480
         self.mh = 270
+        self.mog2 = cv2.createBackgroundSubtractorMOG2(history=90, varThreshold=28, detectShadows=True)
+        self.prev_gray = None
+        self.bg_edges = None
         self.kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        self.kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 21))
+        self.kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 19))
 
     def detect(self, frame_bgr: np.ndarray, sensitivity_thr: float):
         h, w = frame_bgr.shape[:2]
         small = cv2.resize(frame_bgr, (self.mw, self.mh))
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (7, 7), 0)
+        gray_blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        if self.bg_float is None:
-            self.bg_float = gray.astype(np.float32)
+        # Gradiente estrutural (bordas físicas reais — sombras suaves no chão/muro quase não têm bordas internas novas)
+        gx = cv2.Sobel(gray_blur, cv2.CV_16S, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray_blur, cv2.CV_16S, 0, 1, ksize=3)
+        edges = cv2. addWeighted(cv2.convertScaleAbs(gx), 0.5, cv2.convertScaleAbs(gy), 0.5, 0)
+
+        if self.prev_gray is None:
+            self.prev_gray = gray_blur.copy()
+            self.bg_edges = edges.astype(np.float32)
+            self.mog2.apply(small, learningRate=0.5)
             return []
 
-        diff = cv2.absdiff(gray, cv2.convertScaleAbs(self.bg_float))
+        # 1) MOG2 com detecção nativa de sombra (sombra = 127, objeto físico = 255)
+        fg_raw = self.mog2.apply(small, learningRate=0.025)
+        # Descarta todos os pixels de sombra (127) mantendo apenas objetos físicos (255)
+        _, fg_no_shadow = cv2.threshold(fg_raw, 200, 255, cv2.THRESH_BINARY)
 
-        # Mascara o relógio OSD (canto superior esquerdo) e o logo HD-IPC (canto inferior esquerdo)
-        diff[0 : int(self.mh * 0.085), 0 : int(self.mw * 0.39)] = 0
-        diff[int(self.mh * 0.90) :, 0 : int(self.mw * 0.15)] = 0
+        # 2) Diferença de movimento real curto prazo (entre o quadro atual e o anterior) + diferença de bordas físicas
+        step_diff = cv2.absdiff(gray_blur, self.prev_gray)
+        self.prev_gray = cv2.addWeighted(self.prev_gray, 0.65, gray_blur, 0.35, 0)
 
-        # Limiar adaptativo conforme a sensibilidade escolhida pelo usuário (padrão ~18..24 níveis de cinza)
-        pixel_thr = int(max(13, min(32, 12 + sensitivity_thr * 28)))
-        _, thresh = cv2.threshold(diff, pixel_thr, 255, cv2.THRESH_BINARY)
+        edge_diff = cv2.absdiff(edges, cv2.convertScaleAbs(self.bg_edges))
+        cv2.accumulateWeighted(edges, self.bg_edges, 0.04)
 
-        # Proteção contra mudança global de luz (ex.: troca de modo noturno IR / farol iluminando toda a tela)
-        changed_ratio = float(np.count_nonzero(thresh)) / float(self.mw * self.mh)
-        if changed_ratio > 0.38:
-            # Recalibra o fundo rapidamente e ignora este frame de transição de luz
-            cv2.accumulateWeighted(gray, self.bg_float, 0.35)
+        # Mascara relógio OSD (canto superior esquerdo) e logo HD-IPC (canto inferior esquerdo)
+        for m in (fg_no_shadow, step_diff, edge_diff):
+            m[0 : int(self.mh * 0.09), 0 : int(self.mw * 0.40)] = 0
+            m[int(self.mh * 0.90) :, 0 : int(self.mw * 0.16)] = 0
+
+        # Proteção contra mudança global de iluminação (nuvem/sol cobrindo ou descobrindo a rua)
+        changed_ratio = float(np.count_nonzero(fg_no_shadow)) / float(self.mw * self.mh)
+        if changed_ratio > 0.28:
+            self.mog2.apply(small, learningRate=0.40)
+            cv2.accumulateWeighted(edges, self.bg_edges, 0.40)
             return []
 
-        # Remove granulação isolada e une cabeça/tronco/pernas em um único bloco
-        fg = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, self.kernel_open)
+        fg = cv2.morphologyEx(fg_no_shadow, cv2.MORPH_OPEN, self.kernel_open)
         fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, self.kernel_close)
-        fg = cv2.dilate(fg, self.kernel_open, iterations=2)
 
         contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Área mínima de ~0.28% do quadro (captura pessoas caminhando na calçada ou rua, ignora ruído/insetos)
-        min_area = (self.mw * self.mh) * 0.0028
-        raw_boxes = []
-        freeze_mask = np.zeros((self.mh, self.mw), dtype=np.uint8)
+        total_px = float(self.mw * self.mh)
+        min_area = total_px * 0.0032   # ~0.32% da tela (captura animais como cães/gatos e pessoas)
+        max_area = total_px * 0.22     # >22% da tela de uma vez é mudança de sol/sombra, não pessoa/animal
 
+        raw_boxes = []
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area < min_area:
+            if area < min_area or area > max_area:
                 continue
             bx, by, bw, bh = cv2.boundingRect(cnt)
             if bw < 8 or bh < 10:
                 continue
-            raw_boxes.append([bx, by, bx + bw, by + bh, area])
-            # Congela a atualização rápida do fundo sob o objeto para continuar marcando se a pessoa parar!
-            cv2.rectangle(freeze_mask, (bx, by), (bx + bw, by + bh), 255, -1)
+            # Descarta faixas puramente horizontais finas (típicas de sombra de fio/muro no chão)
+            if bw > bh * 2.8:
+                continue
 
-        # Atualiza o fundo normalmente onde não há ninguém, e muito lentamente onde há pessoa presente
-        bg_outside = self.bg_float.copy()
-        cv2.accumulateWeighted(gray, bg_outside, 0.05)
-        bg_inside = self.bg_float.copy()
-        cv2.accumulateWeighted(gray, bg_inside, 0.002)
-        self.bg_float = np.where(freeze_mask > 0, bg_inside, bg_outside)
+            # Exige que a região tenha movimento ativo recente (step_diff) E novas bordas físicas (edge_diff),
+            # eliminando 100% manchas estáticas de sombra ou reflexo de sol na parede/chão!
+            roi_step = step_diff[by : by + bh, bx : bx + bw]
+            roi_edge = edge_diff[by : by + bh, bx : bx + bw]
+            active_motion_px = float(np.count_nonzero(roi_step >= 14)) / float(max(1, bw * bh))
+            active_edge_px = float(np.count_nonzero(roi_edge >= 22)) / float(max(1, bw * bh))
+
+            if active_motion_px < 0.04 or active_edge_px < 0.03:
+                continue
+
+            raw_boxes.append([bx, by, bx + bw, by + bh, area])
 
         if not raw_boxes:
             return []
 
-        # Une caixas muito próximas (ex.: tronco e pernas da mesma pessoa)
-        merged = self._merge_nearby_boxes(raw_boxes, pad_x=int(self.mw * 0.03), pad_y=int(self.mh * 0.04))
+        merged = self._merge_nearby_boxes(raw_boxes, pad_x=int(self.mw * 0.025), pad_y=int(self.mh * 0.035))
 
         scale_x = w / float(self.mw)
         scale_y = h / float(self.mh)
         out = []
         for (x1, y1, x2, y2, area) in merged:
-            # Converte área relativa em um score de confiança visual (0.60 a 0.95)
-            score = min(0.95, 0.62 + (area / float(self.mw * self.mh)) * 4.0)
+            if (x2 - x1) * (y2 - y1) > total_px * 0.25:
+                continue
+            score = min(0.92, 0.60 + (area / total_px) * 3.5)
             out.append((x1 * scale_x, y1 * scale_y, x2 * scale_x, y2 * scale_y, float(score), "movimento"))
         return out
 
@@ -382,7 +401,18 @@ class SmartPresenceTracker:
         return curr
 
 
-# ================= DETECÇÃO IA NEURAL (YOLOv8n ONNX) =================
+# ================= DETECÇÃO IA NEURAL (PESSOAS + ANIMAIS — YOLOv8n ONNX) =================
+COCO_TARGET_CLASSES = {
+    0: "pessoa",
+    1: "pessoa/bike",
+    3: "pessoa/moto",
+    14: "animal (ave)",
+    15: "animal (gato)",
+    16: "animal (cachorro)",
+    17: "animal (cavalo)",
+}
+
+
 def ensure_model():
     if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 5_000_000:
         return
@@ -402,8 +432,8 @@ def ensure_model():
             print(f"[IA] Erro ao baixar de {url}: {e}")
 
 
-def run_yolo_pass(session, input_name: str, img_bgr: np.ndarray, conf_thr: float):
-    """Executa 1 passada do YOLOv8n (640x640) buscando pessoa (0), bicicleta (1), moto (3)."""
+def run_yolo_single(session, input_name: str, img_bgr: np.ndarray, conf_thr: float):
+    """Executa 1 passada do YOLOv8n (640x640) buscando Pessoas e Animais."""
     h, w = img_bgr.shape[:2]
     if h < 16 or w < 16:
         return []
@@ -416,18 +446,20 @@ def run_yolo_pass(session, input_name: str, img_bgr: np.ndarray, conf_thr: float
     if preds.shape[0] < preds.shape[1]:
         preds = preds.T  # (8400, 84)
 
-    # Classes relevantes para rua/calçada: 0=person, 1=bicycle, 3=motorcycle
-    person_scores = preds[:, 4]
-    bike_scores = np.maximum(preds[:, 5], preds[:, 7]) * 0.90
-    scores = np.maximum(person_scores, bike_scores)
+    eff_thr = min(conf_thr, 0.20)
+    target_ids = list(COCO_TARGET_CLASSES.keys())
+    class_Cols = [4 + cid for cid in target_ids]
+    sub_scores = preds[:, class_Cols]
+    best_idx = np.argmax(sub_scores, axis=1)
+    best_scores = sub_scores[np.arange(len(preds)), best_idx]
 
-    eff_thr = min(conf_thr, 0.18)
-    mask = scores >= eff_thr
+    mask = best_scores >= eff_thr
     if not np.any(mask):
         return []
 
     filtered = preds[mask]
-    scores_f = scores[mask]
+    scores_f = best_scores[mask]
+    idx_f = best_idx[mask]
 
     cx = filtered[:, 0] * (w / 640.0)
     cy = filtered[:, 1] * (h / 640.0)
@@ -448,8 +480,36 @@ def run_yolo_pass(session, input_name: str, img_bgr: np.ndarray, conf_thr: float
     out = []
     for idx in np.array(indices).flatten():
         i = int(idx)
-        out.append((float(x1[i]), float(y1[i]), float(x2[i]), float(y2[i]), float(scores_f[i]), "pessoa"))
+        cid = target_ids[int(idx_f[i])]
+        kind = COCO_TARGET_CLASSES.get(cid, "pessoa")
+        out.append((float(x1[i]), float(y1[i]), float(x2[i]), float(y2[i]), float(scores_f[i]), kind))
     return out
+
+
+def run_yolo_pass(session, input_name: str, frame: np.ndarray, poly_px: np.ndarray, conf_thr: float, zoom_zone: bool = False):
+    """Roda YOLOv8n no quadro inteiro e, quando há presença na área, também com Zoom na área demarcada."""
+    h, w = frame.shape[:2]
+    candidates = run_yolo_single(session, input_name, frame, conf_thr)
+
+    if zoom_zone:
+        px1 = max(0, int(np.min(poly_px[:, 0]) - w * 0.06))
+        py1 = max(0, int(np.min(poly_px[:, 1]) - h * 0.06))
+        px2 = min(w, int(np.max(poly_px[:, 0]) + w * 0.06))
+        py2 = min(h, int(np.max(poly_px[:, 1]) + h * 0.06))
+        if (px2 - px1) > w * 0.15 and (py2 - py1) > h * 0.15:
+            crop = frame[py1:py2, px1:px2]
+            for (cx1, cy1, cx2, cy2, sc, kind) in run_yolo_single(session, input_name, crop, conf_thr):
+                candidates.append((cx1 + px1, cy1 + py1, cx2 + px1, cy2 + py1, sc, kind))
+
+    if len(candidates) <= 1:
+        return candidates
+
+    boxes_xywh = [[b[0], b[1], b[2] - b[0], b[3] - b[1]] for b in candidates]
+    scores = [b[4] for b in candidates]
+    indices = cv2.dnn.NMSBoxes(boxes_xywh, scores, min(conf_thr, 0.20), 0.45)
+    if len(indices) == 0:
+        return []
+    return [candidates[int(idx)] for idx in np.array(indices).flatten()]
 
 
 def box_iou(a, b) -> float:
@@ -499,7 +559,7 @@ def annotate_image(frame: np.ndarray, poly_px: np.ndarray, detections: list, dwe
         thickness = 3 if in_zone else 2
         cv2.rectangle(vis, (int(x1), int(y1)), (int(x2), int(y2)), color, thickness)
         if in_zone:
-            label = f"NA AREA ({dwell_sec:.1f}s)"
+            label = f"NA AREA: {kind} ({dwell_sec:.1f}s)"
         else:
             label = f"{kind} {int(score * 100)}%"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
@@ -562,11 +622,11 @@ def monitor_camera_loop():
         # 1) Mapeamento instantâneo de presença/movimento (~3ms de CPU, roda 6x por segundo!)
         motion_boxes = tracker.detect(frame, thr)
 
-        # 2) Executa YOLOv8n quando há movimento/presença OU a cada 1.8s (não trava a CPU gratuita do Render!)
+        # 2) Executa YOLOv8n (Pessoas + Animais) quando há movimento/presença OU a cada 1.8s
         if session is not None and (motion_boxes or (now - last_yolo_ts >= 1.8)):
             last_yolo_ts = now
             try:
-                cached_yolo_boxes = run_yolo_pass(session, input_name, frame, thr)
+                cached_yolo_boxes = run_yolo_pass(session, input_name, frame, poly_px, thr, zoom_zone=bool(motion_boxes))
             except Exception:
                 cached_yolo_boxes = []
         elif now - last_yolo_ts > 2.5:
