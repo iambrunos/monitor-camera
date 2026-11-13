@@ -469,8 +469,8 @@ def box_iou(a, b) -> float:
 
 def is_box_in_poly(box_xyxy, poly_px: np.ndarray, poly_mask: np.ndarray) -> bool:
     """
-    Verifica se a pessoa/movimentação está dentro do polígono demarcado:
-    checa pontos-chave E também a sobreposição real da caixa com a máscara da zona (>= 12%).
+    Verifica se pelo menos 80% da área da caixa da pessoa/movimentação está dentro
+    do polígono demarcado (conforme solicitado: >= 80% dentro da área monitorada).
     """
     h, w = poly_mask.shape[:2]
     x1 = int(max(0, min(w - 1, box_xyxy[0])))
@@ -478,32 +478,14 @@ def is_box_in_poly(box_xyxy, poly_px: np.ndarray, poly_mask: np.ndarray) -> bool
     x2 = int(max(x1 + 1, min(w, box_xyxy[2])))
     y2 = int(max(y1 + 1, min(h, box_xyxy[3])))
 
-    cx = (x1 + x2) / 2.0
-    cy = (y1 + y2) / 2.0
-    lower_y = y1 + (y2 - y1) * 0.78
-    points = [
-        (cx, y2),
-        (cx, lower_y),
-        (cx, cy),
-        (x1 + (x2 - x1) * 0.25, y2),
-        (x2 - (x2 - x1) * 0.25, y2),
-        (x1 + (x2 - x1) * 0.20, cy),
-        (x2 - (x2 - x1) * 0.20, cy),
-    ]
-    for px, py in points:
-        if cv2.pointPolygonTest(poly_px, (float(px), float(py)), False) >= 0:
-            return True
-
-    # Verifica sobreposição percentual da caixa com a máscara preenchida do polígono
     roi = poly_mask[y1:y2, x1:x2]
     if roi.size > 0:
         overlap = float(np.count_nonzero(roi)) / float(roi.size)
-        if overlap >= 0.12:
-            return True
+        return overlap >= 0.80
     return False
 
 
-def annotate_image(frame: np.ndarray, poly_px: np.ndarray, detections: list) -> bytes:
+def annotate_image(frame: np.ndarray, poly_px: np.ndarray, detections: list, dwell_sec: float = 0.0) -> bytes:
     vis = frame.copy()
     # Sombra translúcida leve dentro da área monitorada + borda verde
     overlay = vis.copy()
@@ -512,12 +494,14 @@ def annotate_image(frame: np.ndarray, poly_px: np.ndarray, detections: list) -> 
     cv2.polylines(vis, [poly_px], isClosed=True, color=(122, 209, 51), thickness=2)
 
     for (x1, y1, x2, y2, score, kind, in_zone) in detections:
-        # Vermelho forte se estiver dentro da área monitorada, Amarelo/Laranja se estiver fora
+        # Vermelho forte se estiver >= 80% dentro da área monitorada, Amarelo se estiver fora/parcial
         color = (36, 48, 255) if in_zone else (0, 200, 255)
         thickness = 3 if in_zone else 2
         cv2.rectangle(vis, (int(x1), int(y1)), (int(x2), int(y2)), color, thickness)
-        tag = "NA AREA" if in_zone else kind
-        label = f"{tag} {int(score * 100)}%"
+        if in_zone:
+            label = f"NA AREA ({dwell_sec:.1f}s)"
+        else:
+            label = f"{kind} {int(score * 100)}%"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
         ty = max(th + 6, int(y1))
         cv2.rectangle(vis, (int(x1), ty - th - 6), (int(x1) + tw + 8, ty), color, -1)
@@ -552,7 +536,8 @@ def monitor_camera_loop():
     last_processed_ts = 0.0
     last_yolo_ts = 0.0
     cached_yolo_boxes = []
-    zone_hit_streak = 0
+    in_zone_since = 0.0
+    last_in_zone_seen = 0.0
 
     while True:
         with latest_frame_lock:
@@ -601,25 +586,33 @@ def monitor_camera_loop():
                 any_in_zone = True
             detections.append((x1, y1, x2, y2, score, kind, in_zone))
 
-        jpg = annotate_image(frame, poly_px, detections)
+        if any_in_zone:
+            last_in_zone_seen = now
+            if in_zone_since == 0.0:
+                in_zone_since = now
+            dwell_sec = now - in_zone_since
+        else:
+            # Tolerância de 0.65s para não zerar o cronômetro de 3s se oscilar 1 quadro
+            if now - last_in_zone_seen > 0.65:
+                in_zone_since = 0.0
+                dwell_sec = 0.0
+            else:
+                dwell_sec = (now - in_zone_since) if in_zone_since > 0.0 else 0.0
+
+        jpg = annotate_image(frame, poly_px, detections, dwell_sec)
         with latest_frame_lock:
             latest_annotated_jpeg = jpg
 
-        if any_in_zone:
-            zone_hit_streak += 1
-        else:
-            zone_hit_streak = 0
-
-        # Confirmação em 2 quadros (~0.25s) para enviar foto com a pessoa bem visível dentro da área
-        if zone_hit_streak >= 2 and state["alerts_on"]:
+        # Só dispara o alerta se estiver >= 80% dentro da área por MAIS de 3.0 segundos!
+        if any_in_zone and dwell_sec >= 3.0 and state["alerts_on"]:
             if now - state["last_alert_ts"] >= state["cooldown_sec"]:
                 state["last_alert_ts"] = now
                 state["total_alerts"] += 1
                 hora = now_brt_str()
-                print(f"[ALERTA] Presença/Pessoa detectada na área às {hora}!")
+                print(f"[ALERTA] Pessoa >=80% na área por {dwell_sec:.1f}s às {hora}!")
                 threading.Thread(
                     target=tg_send_photo,
-                    args=(jpg, f"🚨👤 Pessoa/Movimentação na área monitorada — {hora}"),
+                    args=(jpg, f"🚨👤 Pessoa na área monitorada ({dwell_sec:.1f}s) — {hora}"),
                     daemon=True,
                 ).start()
 
