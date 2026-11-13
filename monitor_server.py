@@ -40,12 +40,16 @@ state = {
     "alerts_on": True,
     "threshold": float(os.getenv("THRESHOLD", "0.22")),
     "cooldown_sec": int(os.getenv("COOLDOWN_SEC", "25")),
-    # Polígono de 4 cantos em frações (0.0 a 1.0)
+    # Polígono de 8 pontos em frações (0.0 a 1.0) para contornar perfeitamente a calçada/rua
     "poly": [
         [0.01, 0.36],
+        [0.20, 0.37],
         [0.38, 0.38],
+        [0.53, 0.68],
         [0.68, 0.99],
+        [0.35, 0.99],
         [0.01, 0.99],
+        [0.01, 0.68],
     ],
     "last_alert_ts": 0.0,
     "total_alerts": 0,
@@ -59,6 +63,18 @@ latest_raw_ts = 0.0
 latest_annotated_jpeg = None
 
 
+def expand_to_8_points(pts):
+    if len(pts) == 4:
+        out = []
+        for i in range(4):
+            p1 = pts[i]
+            p2 = pts[(i + 1) % 4]
+            out.append(p1)
+            out.append([round((p1[0] + p2[0]) / 2.0, 4), round((p1[1] + p2[1]) / 2.0, 4)])
+        return out
+    return pts
+
+
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -67,6 +83,7 @@ def load_state():
                 for k in ("alerts_on", "threshold", "cooldown_sec", "poly"):
                     if k in saved:
                         state[k] = saved[k]
+                state["poly"] = expand_to_8_points(state["poly"])
         except Exception as e:
             print(f"[Config] Erro ao ler {STATE_FILE}: {e}")
 
@@ -813,7 +830,7 @@ async function doLogin(e) {{
     <button class="sec" onclick="resetPoly()">🔄 Resetar Área</button>
     <button class="sec" onclick="location.href='/logout'">🔒 Sair</button>
   </div>
-  <p style="color:#94a3b8;font-size:14px;">Arraste os 4 cantos amarelos sobre a imagem para ajustar a área monitorada e clique em <b>Salvar Área Monitorada</b>.</p>
+  <p style="color:#94a3b8;font-size:14px;">Arraste os <b>8 pontos amarelos (1 a 8)</b> sobre a imagem para contornar a área monitorada e clique em <b>Salvar Área Monitorada</b>.</p>
   <div class="wrap">
     <img id="cam" src="/snapshot.jpg" onload="resizeCanvas()" />
     <canvas id="cv"></canvas>
@@ -847,10 +864,16 @@ function draw() {{
   ctx.lineWidth = 3;
   ctx.stroke();
   poly.forEach((p, i) => {{
+    const px = p[0] * w, py = p[1] * h;
     ctx.beginPath();
-    ctx.arc(p[0] * w, p[1] * h, 9, 0, Math.PI * 2);
+    ctx.arc(px, py, 11, 0, Math.PI * 2);
     ctx.fillStyle = i === dragIdx ? '#ef4444' : '#facc15';
     ctx.fill();
+    ctx.fillStyle = '#000';
+    ctx.font = 'bold 11px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(String(i + 1), px, py);
   }});
 }}
 
@@ -887,14 +910,14 @@ window.addEventListener('touchend', onUp);
 
 async function savePoly() {{
   await fetch('/api/poly', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{poly}})}});
-  alert('Área salva no servidor!');
+  alert('Área de 8 pontos salva no servidor!');
 }}
 async function toggleAlerts() {{
   await fetch('/api/toggle', {{method:'POST'}});
   location.reload();
 }}
 function resetPoly() {{
-  poly = [[0.01,0.36],[0.38,0.38],[0.68,0.99],[0.01,0.99]];
+  poly = [[0.01,0.36],[0.20,0.37],[0.38,0.38],[0.53,0.68],[0.68,0.99],[0.35,0.99],[0.01,0.99],[0.01,0.68]];
   draw();
 }}
 setInterval(() => {{ if (dragIdx < 0) img.src = '/snapshot.jpg?t=' + Date.now(); }}, 1200);
@@ -925,7 +948,7 @@ setInterval(() => {{ if (dragIdx < 0) img.src = '/snapshot.jpg?t=' + Date.now();
         if self.path == "/api/poly":
             length = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(length).decode("utf-8"))
-            if "poly" in body and len(body["poly"]) == 4:
+            if "poly" in body and 3 <= len(body["poly"]) <= 16:
                 state["poly"] = body["poly"]
                 save_state()
             self.send_response(200)
