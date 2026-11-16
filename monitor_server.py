@@ -35,11 +35,16 @@ MODEL_URLS = [
 
 STATE_FILE = "config_state.json"
 
-# Estado dinâmico
+# Estado dinâmico (editável pela Aba de Configurações no Painel Web e via Telegram)
 state = {
     "alerts_on": True,
     "threshold": float(os.getenv("THRESHOLD", "0.22")),
     "cooldown_sec": int(os.getenv("COOLDOWN_SEC", "10")),
+    "dwell_target_sec": float(os.getenv("DWELL_TARGET_SEC", "1.0")),
+    "min_overlap_pct": int(os.getenv("MIN_OVERLAP_PCT", "80")),
+    "detect_people": True,
+    "detect_animals": True,
+    "detect_motion": True,
     # Polígono de 8 pontos em frações (0.0 a 1.0) para contornar perfeitamente a calçada/rua
     "poly": [
         [0.01, 0.36],
@@ -62,6 +67,18 @@ latest_raw_frame = None
 latest_raw_ts = 0.0
 latest_annotated_jpeg = None
 
+PERSIST_KEYS = (
+    "alerts_on",
+    "threshold",
+    "cooldown_sec",
+    "dwell_target_sec",
+    "min_overlap_pct",
+    "detect_people",
+    "detect_animals",
+    "detect_motion",
+    "poly",
+)
+
 
 def expand_to_8_points(pts):
     if len(pts) == 4:
@@ -80,7 +97,7 @@ def load_state():
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 saved = json.load(f)
-                for k in ("alerts_on", "threshold", "cooldown_sec", "poly"):
+                for k in PERSIST_KEYS:
                     if k in saved:
                         state[k] = saved[k]
                 state["poly"] = expand_to_8_points(state["poly"])
@@ -91,16 +108,7 @@ def load_state():
 def save_state():
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "alerts_on": state["alerts_on"],
-                    "threshold": state["threshold"],
-                    "cooldown_sec": state["cooldown_sec"],
-                    "poly": state["poly"],
-                },
-                f,
-                indent=2,
-            )
+            json.dump({k: state[k] for k in PERSIST_KEYS}, f, indent=2)
     except Exception as e:
         print(f"[Config] Erro ao salvar {STATE_FILE}: {e}")
 
@@ -546,8 +554,8 @@ def box_iou(a, b) -> float:
 
 def is_box_in_poly(box_xyxy, poly_px: np.ndarray, poly_mask: np.ndarray) -> bool:
     """
-    Verifica se pelo menos 80% da área da caixa da pessoa/movimentação está dentro
-    do polígono demarcado (conforme solicitado: >= 80% dentro da área monitorada).
+    Verifica se a porcentagem mínima configurada (ex: >= 80%) da área da caixa
+    está dentro do polígono demarcado.
     """
     h, w = poly_mask.shape[:2]
     x1 = int(max(0, min(w - 1, box_xyxy[0])))
@@ -558,7 +566,8 @@ def is_box_in_poly(box_xyxy, poly_px: np.ndarray, poly_mask: np.ndarray) -> bool
     roi = poly_mask[y1:y2, x1:x2]
     if roi.size > 0:
         overlap = float(np.count_nonzero(roi)) / float(roi.size)
-        return overlap >= 0.80
+        min_ratio = max(0.05, min(1.0, float(state.get("min_overlap_pct", 80)) / 100.0))
+        return overlap >= min_ratio
     return False
 
 
@@ -637,16 +646,21 @@ def monitor_camera_loop():
         thr = state["threshold"]
 
         # 1) Mapeamento instantâneo de presença/movimento (~3ms de CPU, roda 6x por segundo!)
-        motion_boxes = tracker.detect(frame, thr)
+        motion_boxes = tracker.detect(frame, thr) if state.get("detect_motion", True) else []
 
         # 2) Executa YOLOv8n (Pessoas + Animais) quando há movimento/presença OU a cada 1.8s
-        if session is not None and (motion_boxes or (now - last_yolo_ts >= 1.8)):
+        if session is not None and (state.get("detect_people", True) or state.get("detect_animals", True)) and (motion_boxes or (now - last_yolo_ts >= 1.8)):
             last_yolo_ts = now
             try:
-                cached_yolo_boxes = run_yolo_pass(session, input_name, frame, poly_px, thr, zoom_zone=bool(motion_boxes))
+                raw_yolo = run_yolo_pass(session, input_name, frame, poly_px, thr, zoom_zone=bool(motion_boxes))
+                cached_yolo_boxes = [
+                    b for b in raw_yolo
+                    if (b[5].startswith("pessoa") and state.get("detect_people", True))
+                    or (b[5].startswith("animal") and state.get("detect_animals", True))
+                ]
             except Exception:
                 cached_yolo_boxes = []
-        elif now - last_yolo_ts > 2.5:
+        elif now - last_yolo_ts > 2.5 or not (state.get("detect_people", True) or state.get("detect_animals", True)):
             cached_yolo_boxes = []
 
         # 3) Combina as detecções da IA com o Mapeador de Movimento/Presença
@@ -669,7 +683,7 @@ def monitor_camera_loop():
                 in_zone_since = now
             dwell_sec = now - in_zone_since
         else:
-            # Tolerância de 0.65s para não zerar o cronômetro de 3s se oscilar 1 quadro
+            # Tolerância de 0.65s para não zerar o cronômetro se oscilar 1 quadro
             if now - last_in_zone_seen > 0.65:
                 in_zone_since = 0.0
                 dwell_sec = 0.0
@@ -680,16 +694,16 @@ def monitor_camera_loop():
         with latest_frame_lock:
             latest_annotated_jpeg = jpg
 
-        # Só dispara o alerta se estiver >= 80% dentro da área por MAIS de 1.0 segundo!
-        if any_in_zone and dwell_sec >= 1.0 and state["alerts_on"]:
+        target_dwell = float(state.get("dwell_target_sec", 1.0))
+        if any_in_zone and dwell_sec >= target_dwell and state["alerts_on"]:
             if now - state["last_alert_ts"] >= state["cooldown_sec"]:
                 state["last_alert_ts"] = now
                 state["total_alerts"] += 1
                 hora = now_brt_str()
-                print(f"[ALERTA] Pessoa >=80% na área por {dwell_sec:.1f}s às {hora}!")
+                print(f"[ALERTA] Alvo na área por {dwell_sec:.1f}s às {hora}!")
                 threading.Thread(
                     target=tg_send_photo,
-                    args=(jpg, f"🚨👤 Pessoa na área monitorada ({dwell_sec:.1f}s) — {hora}"),
+                    args=(jpg, f"🚨👤 Alerta na área monitorada ({dwell_sec:.1f}s) — {hora}"),
                     daemon=True,
                 ).start()
 
@@ -809,32 +823,109 @@ async function doLogin(e) {{
         self.end_headers()
         st = "🟢 ATIVOS" if state["alerts_on"] else "🔴 PAUSADOS"
         poly_json = json.dumps(state["poly"])
+        chk_alerts = "checked" if state.get("alerts_on", True) else ""
+        chk_people = "checked" if state.get("detect_people", True) else ""
+        chk_animals = "checked" if state.get("detect_animals", True) else ""
+        chk_motion = "checked" if state.get("detect_motion", True) else ""
+        dwell_val = state.get("dwell_target_sec", 1.0)
+        overlap_val = state.get("min_overlap_pct", 80)
+        cd_val = state.get("cooldown_sec", 10)
+        thr_val = state.get("threshold", 0.22)
+
         html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Monitor Câmera 24h</title>
 <style>
   body {{ background:#0a0e18; color:#fff; font-family:system-ui,sans-serif; text-align:center; margin:0; padding:16px; }}
-  .bar {{ display:flex; gap:12px; justify-content:center; flex-wrap:wrap; margin:12px 0; }}
-  button {{ background:#2563eb; color:#fff; border:none; padding:10px 16px; border-radius:8px; cursor:pointer; font-weight:600; }}
+  .tabs {{ display:inline-flex; background:#141b2d; border-radius:10px; padding:4px; border:1px solid #26324d; margin:8px 0 14px 0; }}
+  .tab-btn {{ background:transparent; color:#94a3b8; border:none; padding:10px 22px; border-radius:8px; cursor:pointer; font-weight:600; font-size:15px; }}
+  .tab-btn.active {{ background:#2563eb; color:#fff; }}
+  .bar {{ display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin:12px 0; }}
+  button {{ background:#2563eb; color:#fff; border:none; padding:10px 16px; border-radius:8px; cursor:pointer; font-weight:600; font-size:14px; }}
   button.sec {{ background:#334155; }}
+  button.green {{ background:#16a34a; }}
   .wrap {{ position:relative; display:inline-block; max-width:920px; width:100%; }}
   img {{ width:100%; display:block; border-radius:8px; border:2px solid #334155; }}
   canvas {{ position:absolute; left:0; top:0; width:100%; height:100%; cursor:crosshair; }}
+  .cfg-box {{ max-width:600px; margin:0 auto; background:#141b2d; border:1px solid #26324d; border-radius:14px; padding:24px; text-align:left; }}
+  .cfg-row {{ margin-bottom:18px; border-bottom:1px solid #1e293b; padding-bottom:14px; }}
+  .cfg-row:last-child {{ border-bottom:none; margin-bottom:0; padding-bottom:0; }}
+  .cfg-label {{ font-weight:600; font-size:15px; display:block; margin-bottom:4px; color:#f8fafc; }}
+  .cfg-hint {{ font-size:12px; color:#94a3b8; margin-bottom:8px; display:block; }}
+  .cfg-input {{ width:100%; box-sizing:border-box; padding:10px 12px; border-radius:8px; border:1px solid #334155; background:#0a0e18; color:#fff; font-size:15px; }}
+  .chk-row {{ display:flex; align-items:center; gap:10px; margin:8px 0; font-size:15px; cursor:pointer; }}
+  .chk-row input {{ width:18px; height:18px; cursor:pointer; }}
 </style></head>
 <body>
-  <h2>🛡️ Monitor de Câmera 24h — Híbrido (IA + Movimento)</h2>
-  <p>Alertas: <b id="st">{st}</b> | Sensibilidade: <b>{state['threshold']}</b> | Total de Alertas: <b>{state['total_alerts']}</b></p>
-  <div class="bar">
-    <button onclick="savePoly()">💾 Salvar Área Monitorada</button>
-    <button class="sec" onclick="toggleAlerts()">🔔 Ligar/Pausar Alertas</button>
-    <button class="sec" onclick="resetPoly()">🔄 Resetar Área</button>
-    <button class="sec" onclick="location.href='/logout'">🔒 Sair</button>
+  <h2 style="margin:4px 0 8px 0;">🛡️ Monitor de Câmera 24h</h2>
+  <p style="margin:0 0 8px 0;font-size:14px;color:#cbd5e1;">
+    Alertas: <b id="st">{st}</b> &nbsp;|&nbsp; Permanência: <b>{dwell_val}s</b> &nbsp;|&nbsp; Área Mín.: <b>{overlap_val}%</b> &nbsp;|&nbsp; Intervalo: <b>{cd_val}s</b> &nbsp;|&nbsp; Total Enviados: <b>{state['total_alerts']}</b>
+  </p>
+
+  <div class="tabs">
+    <button id="tbtn-cam" class="tab-btn active" onclick="showTab('cam')">📹 Câmera & Área (8 Pontos)</button>
+    <button id="tbtn-cfg" class="tab-btn" onclick="showTab('cfg')">⚙️ Configurações</button>
   </div>
-  <p style="color:#94a3b8;font-size:14px;">Arraste os <b>8 pontos amarelos (1 a 8)</b> sobre a imagem para contornar a área monitorada e clique em <b>Salvar Área Monitorada</b>.</p>
-  <div class="wrap">
-    <img id="cam" src="/snapshot.jpg" onload="resizeCanvas()" />
-    <canvas id="cv"></canvas>
+
+  <!-- ABA 1: CÂMERA AO VIVO E EDITOR DE 8 PONTOS -->
+  <div id="tab-cam">
+    <div class="bar">
+      <button onclick="savePoly()">💾 Salvar Área (8 Pontos)</button>
+      <button class="green" onclick="sendTestPhoto()">📸 Enviar Foto Agora no Telegram</button>
+      <button class="sec" onclick="toggleAlerts()">🔔 Ligar/Pausar Alertas</button>
+      <button class="sec" onclick="resetPoly()">🔄 Resetar Área</button>
+      <button class="sec" onclick="location.href='/logout'">🔒 Sair</button>
+    </div>
+    <p style="color:#94a3b8;font-size:13px;margin:6px 0 10px 0;">Arraste os <b>8 pontos amarelos (1 a 8)</b> sobre a imagem para contornar a área monitorada e clique em <b>Salvar Área</b>.</p>
+    <div class="wrap">
+      <img id="cam" src="/snapshot.jpg" onload="resizeCanvas()" />
+      <canvas id="cv"></canvas>
+    </div>
   </div>
+
+  <!-- ABA 2: CONFIGURAÇÕES IMPORTANTES -->
+  <div id="tab-cfg" style="display:none;">
+    <div class="cfg-box">
+      <div class="cfg-row">
+        <span class="cfg-label">🔔 Status e Filtros de Detecção</span>
+        <span class="cfg-hint">Escolha o que deve ser mapeado e notificado no seu Telegram.</span>
+        <label class="chk-row"><input type="checkbox" id="cfg_alerts_on" {chk_alerts}> <b>Alertas no Telegram Ativados</b></label>
+        <label class="chk-row"><input type="checkbox" id="cfg_people" {chk_people}> 👤 Detectar Pessoas (a pé, bicicleta, moto)</label>
+        <label class="chk-row"><input type="checkbox" id="cfg_animals" {chk_animals}> 🐾 Detectar Animais (cachorros, gatos, aves)</label>
+        <label class="chk-row"><input type="checkbox" id="cfg_motion" {chk_motion}> 🏃 Detectar Movimentação Física (visão de topo / noturna c/ filtro anti-sombra)</label>
+      </div>
+
+      <div class="cfg-row">
+        <label class="cfg-label" for="cfg_dwell">⏱️ Tempo mínimo na área para disparar o alerta (segundos)</label>
+        <span class="cfg-hint">Ex.: 1.0 segundo (evita avisos de quem só passou correndo pela borda).</span>
+        <input class="cfg-input" type="number" step="0.1" min="0.2" max="60" id="cfg_dwell" value="{dwell_val}">
+      </div>
+
+      <div class="cfg-row">
+        <label class="cfg-label" for="cfg_overlap">📐 Porcentagem mínima dentro da área demarcada (%)</label>
+        <span class="cfg-hint">Ex.: 80% significa que pelo menos 80% do quadro da pessoa/animal precisa estar dentro da área verde.</span>
+        <input class="cfg-input" type="number" step="5" min="10" max="100" id="cfg_overlap" value="{overlap_val}">
+      </div>
+
+      <div class="cfg-row">
+        <label class="cfg-label" for="cfg_cooldown">⏳ Intervalo entre um aviso e outro (segundos)</label>
+        <span class="cfg-hint">Ex.: 10 segundos de espera antes de enviar outra foto no Telegram.</span>
+        <input class="cfg-input" type="number" step="1" min="3" max="3600" id="cfg_cooldown" value="{cd_val}">
+      </div>
+
+      <div class="cfg-row">
+        <label class="cfg-label" for="cfg_thr">🎯 Sensibilidade da IA (0.10 a 0.80 — menor = mais sensível)</label>
+        <span class="cfg-hint">Padrão recomendado: 0.22. Diminua para 0.16 se quiser detectar objetos ainda mais difíceis à noite, ou aumente para 0.35 para ser mais rigoroso.</span>
+        <input class="cfg-input" type="number" step="0.02" min="0.10" max="0.80" id="cfg_thr" value="{thr_val}">
+      </div>
+
+      <div style="display:flex;gap:12px;margin-top:18px;flex-wrap:wrap;">
+        <button style="flex:1;padding:13px;" onclick="saveSettings()">💾 Salvar Configurações</button>
+        <button class="green" style="padding:13px;" onclick="sendTestPhoto()">📸 Testar Foto no Telegram</button>
+      </div>
+    </div>
+  </div>
+
 <script>
 let poly = {poly_json};
 let dragIdx = -1;
@@ -842,7 +933,16 @@ const img = document.getElementById('cam');
 const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d');
 
+function showTab(name) {{
+  document.getElementById('tab-cam').style.display = name === 'cam' ? 'block' : 'none';
+  document.getElementById('tab-cfg').style.display = name === 'cfg' ? 'block' : 'none';
+  document.getElementById('tbtn-cam').className = 'tab-btn' + (name === 'cam' ? ' active' : '');
+  document.getElementById('tbtn-cfg').className = 'tab-btn' + (name === 'cfg' ? ' active' : '');
+  if (name === 'cam') setTimeout(resizeCanvas, 50);
+}}
+
 function resizeCanvas() {{
+  if (!img.clientWidth) return;
   cv.width = img.clientWidth;
   cv.height = img.clientHeight;
   draw();
@@ -916,11 +1016,33 @@ async function toggleAlerts() {{
   await fetch('/api/toggle', {{method:'POST'}});
   location.reload();
 }}
+async function sendTestPhoto() {{
+  const r = await fetch('/api/test_photo', {{method:'POST'}});
+  if (r.ok) alert('📸 Foto enviada para o seu Telegram!');
+  else alert('Aguarde alguns segundos e tente novamente.');
+}}
+async function saveSettings() {{
+  const payload = {{
+    alerts_on: document.getElementById('cfg_alerts_on').checked,
+    detect_people: document.getElementById('cfg_people').checked,
+    detect_animals: document.getElementById('cfg_animals').checked,
+    detect_motion: document.getElementById('cfg_motion').checked,
+    dwell_target_sec: parseFloat(document.getElementById('cfg_dwell').value) || 1.0,
+    min_overlap_pct: parseInt(document.getElementById('cfg_overlap').value) || 80,
+    cooldown_sec: parseInt(document.getElementById('cfg_cooldown').value) || 10,
+    threshold: parseFloat(document.getElementById('cfg_thr').value) || 0.22,
+  }};
+  const r = await fetch('/api/settings', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(payload)}});
+  if (r.ok) {{
+    alert('✅ Configurações salvas e aplicadas imediatamente!');
+    location.reload();
+  }}
+}}
 function resetPoly() {{
   poly = [[0.01,0.36],[0.20,0.37],[0.38,0.38],[0.53,0.68],[0.68,0.99],[0.35,0.99],[0.01,0.99],[0.01,0.68]];
   draw();
 }}
-setInterval(() => {{ if (dragIdx < 0) img.src = '/snapshot.jpg?t=' + Date.now(); }}, 1200);
+setInterval(() => {{ if (dragIdx < 0 && document.getElementById('tab-cam').style.display !== 'none') img.src = '/snapshot.jpg?t=' + Date.now(); }}, 1200);
 </script></body></html>"""
         self.wfile.write(html.encode("utf-8"))
 
@@ -954,6 +1076,47 @@ setInterval(() => {{ if (dragIdx < 0) img.src = '/snapshot.jpg?t=' + Date.now();
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"OK")
+            return
+        if self.path == "/api/settings":
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if "alerts_on" in body:
+                state["alerts_on"] = bool(body["alerts_on"])
+            if "detect_people" in body:
+                state["detect_people"] = bool(body["detect_people"])
+            if "detect_animals" in body:
+                state["detect_animals"] = bool(body["detect_animals"])
+            if "detect_motion" in body:
+                state["detect_motion"] = bool(body["detect_motion"])
+            if "dwell_target_sec" in body:
+                state["dwell_target_sec"] = max(0.1, min(60.0, float(body["dwell_target_sec"])))
+            if "min_overlap_pct" in body:
+                state["min_overlap_pct"] = max(5, min(100, int(body["min_overlap_pct"])))
+            if "cooldown_sec" in body:
+                state["cooldown_sec"] = max(2, min(3600, int(body["cooldown_sec"])))
+            if "threshold" in body:
+                state["threshold"] = max(0.10, min(0.85, float(body["threshold"])))
+            save_state()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+            return
+        if self.path == "/api/test_photo":
+            with latest_frame_lock:
+                jpg = latest_annotated_jpeg
+            if jpg:
+                hora = now_brt_str()
+                threading.Thread(
+                    target=tg_send_photo,
+                    args=(jpg, f"📸 Foto enviada pelo Painel Web — {hora}"),
+                    daemon=True,
+                ).start()
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"OK")
+                return
+            self.send_response(503)
+            self.end_headers()
             return
         if self.path == "/api/toggle":
             state["alerts_on"] = not state["alerts_on"]
