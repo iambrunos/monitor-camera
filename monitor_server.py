@@ -39,12 +39,12 @@ STATE_FILE = "config_state.json"
 state = {
     "alerts_on": True,
     "threshold": float(os.getenv("THRESHOLD", "0.22")),
-    "cooldown_sec": int(os.getenv("COOLDOWN_SEC", "25")),
+    "cooldown_sec": int(os.getenv("COOLDOWN_SEC", "10")),
     # Polígono de 8 pontos em frações (0.0 a 1.0) para contornar perfeitamente a calçada/rua
     "poly": [
         [0.01, 0.36],
-        [0.20, 0.37],
-        [0.38, 0.38],
+        [0.20833333333333334, 0.4804603854389722],
+        [0.3790849673202614, 0.42621341898643794],
         [0.53, 0.68],
         [0.68, 0.99],
         [0.35, 0.99],
@@ -680,8 +680,8 @@ def monitor_camera_loop():
         with latest_frame_lock:
             latest_annotated_jpeg = jpg
 
-        # Só dispara o alerta se estiver >= 80% dentro da área por MAIS de 3.0 segundos!
-        if any_in_zone and dwell_sec >= 3.0 and state["alerts_on"]:
+        # Só dispara o alerta se estiver >= 80% dentro da área por MAIS de 1.0 segundo!
+        if any_in_zone and dwell_sec >= 1.0 and state["alerts_on"]:
             if now - state["last_alert_ts"] >= state["cooldown_sec"]:
                 state["last_alert_ts"] = now
                 state["total_alerts"] += 1
